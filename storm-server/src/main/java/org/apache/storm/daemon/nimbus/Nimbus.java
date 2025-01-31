@@ -26,6 +26,7 @@ import com.codahale.metrics.MetricRegistry;
 import com.codahale.metrics.MetricSet;
 import com.codahale.metrics.SlidingTimeWindowReservoir;
 import com.codahale.metrics.Timer;
+
 import java.io.File;
 import java.io.FileInputStream;
 import java.io.FileOutputStream;
@@ -34,9 +35,11 @@ import java.io.InterruptedIOException;
 import java.io.OutputStream;
 import java.net.BindException;
 import java.net.ServerSocket;
+import java.net.URLDecoder;
 import java.nio.ByteBuffer;
 import java.nio.channels.Channels;
 import java.nio.channels.WritableByteChannel;
+import java.nio.charset.StandardCharsets;
 import java.security.Principal;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -82,6 +85,7 @@ import org.apache.storm.container.oci.OciUtils;
 import org.apache.storm.daemon.DaemonCommon;
 import org.apache.storm.daemon.Shutdownable;
 import org.apache.storm.daemon.StormCommon;
+import org.apache.storm.daemon.common.FileWatcher;
 import org.apache.storm.generated.AlreadyAliveException;
 import org.apache.storm.generated.Assignment;
 import org.apache.storm.generated.AuthorizationException;
@@ -187,6 +191,7 @@ import org.apache.storm.security.auth.IAuthorizer;
 import org.apache.storm.security.auth.ICredentialsRenewer;
 import org.apache.storm.security.auth.IGroupMappingServiceProvider;
 import org.apache.storm.security.auth.IPrincipalToLocal;
+import org.apache.storm.security.auth.MultiThriftServer;
 import org.apache.storm.security.auth.NimbusPrincipal;
 import org.apache.storm.security.auth.ReqContext;
 import org.apache.storm.security.auth.ThriftConnectionType;
@@ -303,7 +308,7 @@ public class Nimbus implements Iface, Shutdownable, DaemonCommon {
         NIMBUS_SUBJECT.getPrincipals().add(new NimbusPrincipal());
         NIMBUS_SUBJECT.setReadOnly();
     }
-    
+
     private static final TopologyStateTransition NOOP_TRANSITION = (arg, nimbus, topoId, base) -> null;
     private static final TopologyStateTransition INACTIVE_TRANSITION = (arg, nimbus, topoId, base) -> Nimbus.make(TopologyStatus.INACTIVE);
     private static final TopologyStateTransition ACTIVE_TRANSITION = (arg, nimbus, topoId, base) -> Nimbus.make(TopologyStatus.ACTIVE);
@@ -1191,6 +1196,22 @@ public class Nimbus implements Iface, Shutdownable, DaemonCommon {
             enforceNettyAuth);
         ret.put(Config.STORM_MESSAGING_NETTY_AUTHENTICATION, enforceNettyAuth);
 
+        // Adjust whether the workers of the topology use thrift TLS or non-TLS client to connect to Nimbus
+        // Use TLS if either the daemon conf or the topology conf has Config.TOPOLOGY_WORKER_NIMBUS_THRIFT_CLIENT_USE_TLS set true.
+        boolean workerNimbusClientTlsEnabled = (Boolean) conf.get(Config.TOPOLOGY_WORKER_NIMBUS_THRIFT_CLIENT_USE_TLS);
+        if (topoConf.containsKey(Config.TOPOLOGY_WORKER_NIMBUS_THRIFT_CLIENT_USE_TLS)) {
+            workerNimbusClientTlsEnabled = workerNimbusClientTlsEnabled
+                                        || (boolean) topoConf.get(Config.TOPOLOGY_WORKER_NIMBUS_THRIFT_CLIENT_USE_TLS);
+        }
+        LOG.debug("For {}, topo conf is: {}, daemon conf is {}; Set it as {}",
+                Config.TOPOLOGY_WORKER_NIMBUS_THRIFT_CLIENT_USE_TLS,
+                topoConf.get(Config.TOPOLOGY_WORKER_NIMBUS_THRIFT_CLIENT_USE_TLS),
+                conf.get(Config.TOPOLOGY_WORKER_NIMBUS_THRIFT_CLIENT_USE_TLS),
+                workerNimbusClientTlsEnabled);
+        LOG.debug("Set {} as {}", Config.NIMBUS_THRIFT_CLIENT_USE_TLS, workerNimbusClientTlsEnabled);
+        ret.put(Config.TOPOLOGY_WORKER_NIMBUS_THRIFT_CLIENT_USE_TLS, workerNimbusClientTlsEnabled);
+        ret.put(Config.NIMBUS_THRIFT_CLIENT_USE_TLS, workerNimbusClientTlsEnabled);
+
         if (!mergedConf.containsKey(Config.TOPOLOGY_METRICS_REPORTERS) && mergedConf.containsKey(Config.STORM_METRICS_REPORTERS)) {
             ret.put(Config.TOPOLOGY_METRICS_REPORTERS, mergedConf.get(Config.STORM_METRICS_REPORTERS));
         }
@@ -1396,15 +1417,16 @@ public class Nimbus implements Iface, Shutdownable, DaemonCommon {
     @VisibleForTesting
     public void launchServer() throws Exception {
         try {
-            IStormClusterState state = stormClusterState;
-            NimbusInfo hpi = nimbusHostPortInfo;
-
             LOG.info("Starting Nimbus with conf {}", ConfigUtils.maskPasswords(conf));
             validator.prepare(conf);
 
+            IStormClusterState state = stormClusterState;
+            NimbusInfo hpi = nimbusHostPortInfo;
+
             //add to nimbuses
-            state.addNimbusHost(hpi.getHost(),
-                    new NimbusSummary(hpi.getHost(), hpi.getPort(), Time.currentTimeSecs(), false, STORM_VERSION));
+            NimbusSummary nimbusSummary = new NimbusSummary(hpi.getHost(), hpi.getPort(), Time.currentTimeSecs(), false, STORM_VERSION);
+            nimbusSummary.set_tlsPort(hpi.getTlsPort());
+            state.addNimbusHost(hpi.getHost(), nimbusSummary);
             leaderElector.addToLeaderLockQueue();
             this.blobStore.startSyncBlobs();
 
@@ -1553,18 +1575,27 @@ public class Nimbus implements Iface, Shutdownable, DaemonCommon {
         StormMetricsRegistry metricsRegistry = new StormMetricsRegistry();
         final Nimbus nimbus = new Nimbus(conf, inimbus, metricsRegistry);
         nimbus.launchServer();
-        final ThriftServer server = new ThriftServer(conf, new Processor<>(nimbus), ThriftConnectionType.NIMBUS);
+
+        MultiThriftServer<ThriftServer> multiThriftServer = new MultiThriftServer<>("nimbus-thrift-server");
+        if (!ObjectReader.getBoolean(conf.get(Config.NIMBUS_THRIFT_TLS_SERVER_ONLY), false)) {
+            multiThriftServer.add(new ThriftServer(conf, new Processor<>(nimbus), ThriftConnectionType.NIMBUS));
+        }
+        int tlsPort = ObjectReader.getInt(conf.get(Config.NIMBUS_THRIFT_TLS_PORT));
+        if (tlsPort > 0) {
+            multiThriftServer.add(new ThriftServer(conf, new Processor<>(nimbus), ThriftConnectionType.NIMBUS_TLS));
+        }
+
         metricsRegistry.startMetricsReporters(conf);
         Utils.addShutdownHookWithDelayedForceKill(() -> {
             metricsRegistry.stopMetricsReporters();
             nimbus.shutdown();
-            server.stop();
+            multiThriftServer.stop();
         }, 10);
-        if (ClientAuthUtils.areWorkerTokensEnabledServer(server, conf)) {
+        if (ClientAuthUtils.areWorkerTokensEnabledServer(multiThriftServer, conf)) {
             nimbus.initWorkerTokenManager();
         }
         LOG.info("Starting nimbus server for storm version '{}'", STORM_VERSION);
-        server.serve();
+        multiThriftServer.serve();
         return nimbus;
     }
 
@@ -2748,10 +2779,13 @@ public class Nimbus implements Iface, Shutdownable, DaemonCommon {
     @VisibleForTesting
     public void checkAuthorization(String topoName, Map<String, Object> topoConf, String operation, ReqContext context)
             throws AuthorizationException {
+
+
         IAuthorizer impersonationAuthorizer = impersonationAuthorizationHandler;
         if (context == null) {
             context = ReqContext.context();
         }
+
         Map<String, Object> checkConf = new HashMap<>();
         if (topoConf != null) {
             checkConf.putAll(topoConf);
@@ -3184,7 +3218,7 @@ public class Nimbus implements Iface, Shutdownable, DaemonCommon {
         ret.allComponents = new HashSet<>(ret.taskToComponent.values());
         return ret;
     }
-    
+
     @VisibleForTesting
     public boolean awaitLeadership(long timeout, TimeUnit timeUnit) throws InterruptedException {
         return leaderElector.awaitLeadership(timeout, timeUnit);
@@ -3251,7 +3285,7 @@ public class Nimbus implements Iface, Shutdownable, DaemonCommon {
 
             ReqContext req = ReqContext.context();
             Principal principal = req.principal();
-            String submitterPrincipal = principal == null ? null : principal.toString();
+            String submitterPrincipal = principal == null ? null : principalToLocal.toLocal(principal);
             Set<String> topoAcl = new HashSet<>(ObjectReader.getStrings(topoConf.get(Config.TOPOLOGY_USERS)));
             topoAcl.add(submitterPrincipal);
             String submitterUser = principalToLocal.toLocal(principal);
@@ -3758,7 +3792,7 @@ public class Nimbus implements Iface, Shutdownable, DaemonCommon {
             } else {
                 Principal p = ReqContext.context().principal();
                 if (p != null) {
-                    expectedOwner = p.getName();
+                    expectedOwner = principalToLocal.toLocal(p);
                 }
             }
             // expectedOwner being null means that security is disabled (which why are we uploading credentials with security disabled???
@@ -4075,6 +4109,8 @@ public class Nimbus implements Iface, Shutdownable, DaemonCommon {
                 state.setupBlob(key, ni, getVersionForKey(key, ni, zkClient));
             }
             LOG.debug("Created state in zookeeper {} {} {}", state, store, ni);
+        } catch (KeyNotFoundException e) {
+            LOG.warn("Key not found while creating state in zookeeper - key: " + key, e);
         } catch (Exception e) {
             LOG.warn("Exception while creating state in zookeeper - key: " + key, e);
             if (e instanceof TException) {
@@ -4685,26 +4721,27 @@ public class Nimbus implements Iface, Shutdownable, DaemonCommon {
                 nodeToHost = Collections.emptyMap();
             }
 
+            String sanitizedComponentId = URLDecoder.decode(componentId, StandardCharsets.UTF_8);
             ComponentPageInfo compPageInfo = StatsUtil.aggCompExecsStats(exec2HostPort, info.taskToComponent, info.beats, window,
-                                                                         includeSys, topoId, topology, componentId);
+                                                                         includeSys, topoId, topology, sanitizedComponentId);
             if (compPageInfo.get_component_type() == ComponentType.SPOUT) {
-                NormalizedResourceRequest spoutResources = ResourceUtils.getSpoutResources(topology, topoConf, componentId);
+                NormalizedResourceRequest spoutResources = ResourceUtils.getSpoutResources(topology, topoConf, sanitizedComponentId);
                 if (spoutResources == null) {
-                    spoutResources = new NormalizedResourceRequest(topoConf, componentId);
+                    spoutResources = new NormalizedResourceRequest(topoConf, sanitizedComponentId);
                 }
                 compPageInfo.set_resources_map(spoutResources.toNormalizedMap());
             } else { //bolt
-                NormalizedResourceRequest boltResources = ResourceUtils.getBoltResources(topology, topoConf, componentId);
+                NormalizedResourceRequest boltResources = ResourceUtils.getBoltResources(topology, topoConf, sanitizedComponentId);
                 if (boltResources == null) {
-                    boltResources = new NormalizedResourceRequest(topoConf, componentId);
+                    boltResources = new NormalizedResourceRequest(topoConf, sanitizedComponentId);
                 }
                 compPageInfo.set_resources_map(boltResources.toNormalizedMap());
             }
             compPageInfo.set_topology_name(info.topoName);
-            compPageInfo.set_errors(stormClusterState.errors(topoId, componentId));
+            compPageInfo.set_errors(stormClusterState.errors(topoId, sanitizedComponentId));
             compPageInfo.set_topology_status(extractStatusStr(info.base));
             if (info.base.is_set_component_debug()) {
-                DebugOptions debug = info.base.get_component_debug().get(componentId);
+                DebugOptions debug = info.base.get_component_debug().get(sanitizedComponentId);
                 if (debug != null) {
                     compPageInfo.set_debug_options(debug);
                 }
@@ -4715,7 +4752,7 @@ public class Nimbus implements Iface, Shutdownable, DaemonCommon {
                 List<Integer> tasks = compToTasks.get(StormCommon.EVENTLOGGER_COMPONENT_ID);
                 tasks.sort(null);
                 // Find the task the events from this component route to.
-                int taskIndex = TupleUtils.chooseTaskIndex(Collections.singletonList(componentId), tasks.size());
+                int taskIndex = TupleUtils.chooseTaskIndex(Collections.singletonList(sanitizedComponentId), tasks.size());
                 int taskId = tasks.get(taskIndex);
                 String host = null;
                 Integer port = null;
@@ -5278,7 +5315,7 @@ public class Nimbus implements Iface, Shutdownable, DaemonCommon {
     private static class ClusterSummaryMetrics implements MetricSet {
         private static final String SUMMARY = "summary";
         private final Map<String, com.codahale.metrics.Metric> metrics = new HashMap<>();
-        
+
         public com.codahale.metrics.Metric put(String key, com.codahale.metrics.Metric value) {
             return metrics.put(MetricRegistry.name(SUMMARY, key), value);
         }
@@ -5288,12 +5325,12 @@ public class Nimbus implements Iface, Shutdownable, DaemonCommon {
             return metrics;
         }
     }
-    
+
     private class ClusterSummaryMetricSet implements Runnable {
         private static final int CACHING_WINDOW = 5;
-        
+
         private final ClusterSummaryMetrics clusterSummaryMetrics = new ClusterSummaryMetrics();
-        
+
         private final Function<String, Histogram> registerHistogram = (name) -> {
             //This histogram reflects the data distribution across only one ClusterSummary, i.e.,
             // data distribution across all entities of a type (e.g., data from all nimbus/topologies) at one moment.
